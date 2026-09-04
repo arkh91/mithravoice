@@ -142,3 +142,12 @@ CREATE TABLE telegram_admins (
     added_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_telegram_admins_user (telegram_user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE telegram_accounts (
+    UserID INT PRIMARY KEY,  -- Telegram ID
+    FirstName VARCHAR(50),
+    LastName VARCHAR(50),
+    Username VARCHAR(50),
+    CurrentBalance DECIMAL(10,2) DEFAULT 0.00,
+    CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);
