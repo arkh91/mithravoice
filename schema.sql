@@ -132,3 +132,13 @@ INSERT INTO plans (code, name, max_devices, online_allowed, offline_allowed, pri
 VALUES
     ('solo_monthly', 'Solo', 1, 1, 1, 1900, 'monthly'),
     ('team_monthly', 'Team', 5, 1, 1, 7900, 'monthly');
+
+CREATE TABLE telegram_admins (
+    id                CHAR(36)     NOT NULL DEFAULT (UUID()) PRIMARY KEY,
+    telegram_user_id  BIGINT UNSIGNED NOT NULL,      -- Telegram's numeric user ID
+    username          VARCHAR(255),                   -- Telegram @username, may change/be null
+    role              ENUM('superadmin','admin','moderator') NOT NULL DEFAULT 'admin',
+    is_active         TINYINT(1)   NOT NULL DEFAULT 1,
+    added_at          TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_telegram_admins_user (telegram_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
