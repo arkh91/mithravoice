@@ -193,4 +193,4 @@ CREATE TABLE telegram_admins (
 -- online_usage_periods exceeded_at path without waiting on real usage.
 INSERT INTO plans (code, name, max_devices, online_allowed, offline_allowed, price_cents, billing_interval, online_hours_included)
 VALUES
-    ('test_1hr', 'Test (1hr online)', 1, 1, 1, 0, 'monthly', 1);
+    ('test', 'Test (1hr online)', 1, 1, 1, 0, 'monthly', 1);
