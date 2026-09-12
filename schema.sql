@@ -13,12 +13,19 @@
 --
 -- Model:
 --   users          — a customer (one email, may hold several subscriptions over time)
---   plans          — sellable tiers (Online/Offline Bronze/Silver/Gold, PAYG, etc.) defining seat count + feature flags
+--   plans          — sellable tiers (Solo, Team, etc.) defining seat count + feature flags,
+--                    including how many online-engine hours are bundled per period
 --   subscriptions  — a user's purchase of a plan for a billing period
 --   license_keys   — the actual key string a user types into the app; belongs to one subscription
 --   devices        — machines a key has been activated on, capped by plan.max_devices
 --   activation_events — audit trail of every activate/heartbeat/deactivate call
 --   usage_sessions — optional analytics: how long, which engine (online/offline), per device
+--   app_versions   — published release metadata used for update checks
+--   online_usage_periods — rolling per-key online-engine quota tracking (one row per
+--                    billing period per key), used to enforce plans.online_hours_included
+--   telegram_accounts — Telegram bot end users (support/notifications bot), keyed by
+--                    the numeric Telegram user id; independent of the users table above
+--   telegram_admins   — staff allowed to operate the Telegram bot's admin commands
 
 CREATE DATABASE IF NOT EXISTS mithravoice
     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -35,16 +42,17 @@ CREATE TABLE users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE plans (
-    id                     CHAR(36)      NOT NULL DEFAULT (UUID()) PRIMARY KEY,
-    code                   VARCHAR(64)   NOT NULL,                 -- e.g. 'offline_silver_monthly', 'online_payg_hourly'
-    name                   VARCHAR(100)  NOT NULL,                 -- e.g. 'Offline Silver'
-    max_devices            INT           NOT NULL DEFAULT 1,
-    online_allowed         TINYINT(1)    NOT NULL DEFAULT 1,        -- can use the Azure engine
-    offline_allowed        TINYINT(1)    NOT NULL DEFAULT 1,        -- can use the Whisper+Argos engine
-    price_cents            INT           NOT NULL DEFAULT 0,        -- period total for monthly/annual/lifetime; per-hour rate for 'hourly'
+    id                     CHAR(36)     NOT NULL DEFAULT (UUID()) PRIMARY KEY,
+    code                   VARCHAR(64)  NOT NULL,                 -- e.g. 'solo_monthly', 'team_annual'
+    name                   VARCHAR(100) NOT NULL,                 -- e.g. 'Solo'
+    max_devices            INT          NOT NULL DEFAULT 1,
+    online_allowed         TINYINT(1)   NOT NULL DEFAULT 1,        -- can use the Azure engine
+    offline_allowed        TINYINT(1)   NOT NULL DEFAULT 1,        -- can use the Whisper+Argos engine
+    price_cents            INT          NOT NULL DEFAULT 0,
     billing_interval       ENUM('monthly','annual','lifetime','hourly') NOT NULL DEFAULT 'monthly',
-    created_at             TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    online_hours_included  INT UNSIGNED,                            -- hours bundled per period on online plans; NULL for offline-only and PAYG plans
+    created_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    online_hours_included  INT UNSIGNED,                          -- online-engine quota per billing
+                                                                    -- period; NULL = unmetered/unlimited
     UNIQUE KEY uq_plans_code (code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -97,7 +105,8 @@ CREATE TABLE activation_events (
     created_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_activation_events_license_key FOREIGN KEY (license_key_id) REFERENCES license_keys(id) ON DELETE SET NULL,
     CONSTRAINT fk_activation_events_device FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE SET NULL,
-    KEY idx_activation_events_key (license_key_id)
+    KEY idx_activation_events_key (license_key_id),
+    KEY idx_activation_events_device (device_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE usage_sessions (
@@ -110,7 +119,8 @@ CREATE TABLE usage_sessions (
     duration_seconds  INT,
     CONSTRAINT fk_usage_sessions_license_key FOREIGN KEY (license_key_id) REFERENCES license_keys(id) ON DELETE CASCADE,
     CONSTRAINT fk_usage_sessions_device FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
-    KEY idx_usage_sessions_key (license_key_id)
+    KEY idx_usage_sessions_key (license_key_id),
+    KEY idx_usage_sessions_device (device_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Tracks published app releases so the client can check "is a newer
@@ -128,11 +138,62 @@ CREATE TABLE app_versions (
     UNIQUE KEY uq_app_versions_version (version)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Usage: Seeds the live MithraVoice plan lineup (Online + Offline
--- Bronze/Silver/Gold, the free internal test plan, and Online
--- Pay-As-You-Go) so create_license_key.py and the pricing page have
--- real plans to reference on a fresh install. Replaces the old
--- placeholder 'solo'/'team' seed rows.
+-- One row per license key per billing period, used to meter the online
+-- (Azure) engine against plans.online_hours_included. Usage: on every
+-- online usage_session close, the app adds duration_seconds to the row
+-- for that key_code + current period (creating it if absent), and stamps
+-- exceeded_at the first time seconds_used passes seconds_included, which
+-- the API then uses to deny further online activity until the period rolls.
+-- Keyed by key_code (not license_key_id) so it survives a key being
+-- reissued/rotated on the same subscription without losing usage history.
+CREATE TABLE online_usage_periods (
+    id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    key_code           VARCHAR(32)  NOT NULL,
+    period_start       DATE         NOT NULL,
+    period_end         DATE         NOT NULL,
+    seconds_used       INT UNSIGNED NOT NULL DEFAULT 0,
+    seconds_included   INT UNSIGNED NOT NULL,           -- snapshot of plan.online_hours_included*3600
+                                                          -- at period creation, so later plan changes
+                                                          -- don't retroactively alter past periods
+    exceeded_at        TIMESTAMP    NULL,
+    updated_at         TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_online_usage_periods_key_code FOREIGN KEY (key_code) REFERENCES license_keys(key_code) ON DELETE CASCADE,
+    UNIQUE KEY uq_online_usage_periods_key_period (key_code, period_start, period_end),
+    KEY idx_online_usage_periods_key_code (key_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Telegram support/notifications bot subsystem. Deliberately independent
+-- of the `users` table above — UserID here is Telegram's own numeric
+-- account id, populated the first time someone messages the bot, not a
+-- customer signup. CurrentBalance is used for bot-side credit/payment
+-- features unrelated to the subscription billing model.
+CREATE TABLE telegram_accounts (
+    UserID           INT            NOT NULL PRIMARY KEY,       -- Telegram user id (from the Bot API), not app-generated
+    FirstName        VARCHAR(50),
+    LastName         VARCHAR(50),
+    Username         VARCHAR(50),
+    CurrentBalance   DECIMAL(10,2) DEFAULT 0.00,
+    CreatedAt        DATETIME      DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Staff permitted to run privileged commands in the Telegram bot.
+-- UserID is unique (one admin row per Telegram account); Role gates
+-- which bot commands are available (moderator < admin < superadmin).
+CREATE TABLE telegram_admins (
+    AdminID    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    UserID     BIGINT UNSIGNED NOT NULL,
+    Username   VARCHAR(255),
+    Role       ENUM('superadmin','admin','moderator') DEFAULT 'admin',
+    AddedAt    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    IsActive   TINYINT(1) DEFAULT 1,
+    UNIQUE KEY uq_telegram_admins_userid (UserID)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Usage: Seeds the live MithraVoice plan lineup on a fresh install —
+-- Online + Offline Bronze/Silver/Gold, Online Pay-As-You-Go (metered
+-- hourly, no commitment), and the internal 'test' plan used to exercise
+-- the online_usage_periods exceeded_at path with a tight 1-hour quota
+-- without waiting on real usage.
 INSERT INTO plans
     (code, name, max_devices, online_allowed, offline_allowed, price_cents, billing_interval, online_hours_included)
 VALUES
