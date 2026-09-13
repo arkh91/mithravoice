@@ -131,8 +131,8 @@ CREATE TABLE usage_sessions (
 CREATE TABLE app_versions (
     id             CHAR(36)     NOT NULL DEFAULT (UUID()) PRIMARY KEY,
     version        VARCHAR(20)  NOT NULL,          -- e.g. '2.0.1', matches the VERSION file used at build time
-    is_latest      TINYINT(1)   NOT NULL DEFAULT 0,
-    download_url   VARCHAR(500) NOT NULL,          -- e.g. https://mithracorp.com/mithravoice/versions.html
+    is_latest      TINYINT(1)   NOT NULL DEFAULT 1,
+    download_url   VARCHAR(500) NULL,              -- e.g. https://mithracorp.com/mithravoice/versions.html
     release_notes  TEXT,
     released_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_app_versions_version (version)
